@@ -1,0 +1,8 @@
+fastTCPScan
+*.exe
+dist/
+.git/
+.github/
+*_test.go
+README.md
+LICENSE
