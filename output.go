@@ -5,40 +5,11 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"net"
 	"sort"
 )
 
-// --- XML (estilo Nmap) ---
-
-type xmlState struct {
-	State string `xml:"state,attr"`
-}
-
-type xmlService struct {
-	Name    string `xml:"name,attr,omitempty"`
-	Version string `xml:"version,attr,omitempty"`
-	Banner  string `xml:"banner,attr,omitempty"`
-}
-
-type xmlPort struct {
-	Protocol string     `xml:"protocol,attr"`
-	PortID   int        `xml:"portid,attr"`
-	State    xmlState   `xml:"state"`
-	Service  xmlService `xml:"service"`
-}
-
-type xmlHost struct {
-	Addr  string    `xml:"addr,attr"`
-	RDNS  string    `xml:"rdns,attr,omitempty"`
-	Ports []xmlPort `xml:"ports>port"`
-}
-
-type xmlRun struct {
-	XMLName xml.Name  `xml:"scanresults"`
-	Hosts   []xmlHost `xml:"host"`
-}
-
-// groupByHost agrupa los resultados por host conservando el orden.
+// groupByHost agrupa los resultados por host conservando un orden estable.
 func groupByHost(found []Result) ([]string, map[string][]Result) {
 	order := []string{}
 	byHost := map[string][]Result{}
@@ -52,26 +23,102 @@ func groupByHost(found []Result) ([]string, map[string][]Result) {
 	return order, byHost
 }
 
+// --- XML compatible con Nmap (esquema nmaprun) ---
+
+type nmapState struct {
+	State  string `xml:"state,attr"`
+	Reason string `xml:"reason,attr,omitempty"`
+}
+
+type nmapService struct {
+	Name    string `xml:"name,attr,omitempty"`
+	Product string `xml:"product,attr,omitempty"`
+	Method  string `xml:"method,attr"`
+	Conf    int    `xml:"conf,attr"`
+}
+
+type nmapPort struct {
+	Protocol string      `xml:"protocol,attr"`
+	PortID   int         `xml:"portid,attr"`
+	State    nmapState   `xml:"state"`
+	Service  nmapService `xml:"service"`
+}
+
+type nmapAddress struct {
+	Addr     string `xml:"addr,attr"`
+	AddrType string `xml:"addrtype,attr"`
+}
+
+type nmapHostname struct {
+	Name string `xml:"name,attr"`
+	Type string `xml:"type,attr"`
+}
+
+type nmapHost struct {
+	Status struct {
+		State string `xml:"state,attr"`
+	} `xml:"status"`
+	Address   nmapAddress    `xml:"address"`
+	Hostnames []nmapHostname `xml:"hostnames>hostname,omitempty"`
+	Ports     []nmapPort     `xml:"ports>port"`
+}
+
+type nmapRun struct {
+	XMLName          xml.Name   `xml:"nmaprun"`
+	Scanner          string     `xml:"scanner,attr"`
+	Args             string     `xml:"args,attr"`
+	XMLOutputVersion string     `xml:"xmloutputversion,attr"`
+	Hosts            []nmapHost `xml:"host"`
+}
+
+func addrType(host string) string {
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		return "ipv6"
+	}
+	return "ipv4"
+}
+
 func writeXML(w io.Writer, found []Result) error {
 	order, byHost := groupByHost(found)
-	run := xmlRun{}
+
+	method := "table"
+	if *sv {
+		method = "probed"
+	}
+
+	run := nmapRun{
+		Scanner:          "fastTCPScan",
+		Args:             "fastTCPScan",
+		XMLOutputVersion: "1.05",
+	}
+
 	for _, h := range order {
-		xh := xmlHost{Addr: h}
+		host := nmapHost{}
+		host.Status.State = "up"
+		host.Address = nmapAddress{Addr: h, AddrType: addrType(h)}
+
 		for _, r := range byHost[h] {
-			if r.RDNS != "" {
-				xh.RDNS = r.RDNS
+			if r.RDNS != "" && len(host.Hostnames) == 0 {
+				host.Hostnames = append(host.Hostnames, nmapHostname{Name: r.RDNS, Type: "PTR"})
 			}
-			xh.Ports = append(xh.Ports, xmlPort{
+			product := r.Version
+			if product == "" {
+				product = r.Banner
+			}
+			host.Ports = append(host.Ports, nmapPort{
 				Protocol: r.Proto,
 				PortID:   r.Port,
-				State:    xmlState{State: r.State},
-				Service:  xmlService{Name: r.Service, Version: r.Version, Banner: r.Banner},
+				State:    nmapState{State: r.State, Reason: "response"},
+				Service:  nmapService{Name: r.Service, Product: product, Method: method, Conf: 10},
 			})
 		}
-		run.Hosts = append(run.Hosts, xh)
+		run.Hosts = append(run.Hosts, host)
 	}
 
 	if _, err := io.WriteString(w, xml.Header); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "<!DOCTYPE nmaprun>\n"); err != nil {
 		return err
 	}
 	enc := xml.NewEncoder(w)
@@ -94,30 +141,37 @@ var htmlTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
   body { font-family: system-ui, sans-serif; margin: 2rem; color: #222; }
   h1 { color: #056; }
   table { border-collapse: collapse; width: 100%; margin-bottom: 2rem; }
-  th, td { border: 1px solid #ccc; padding: .4rem .6rem; text-align: left; font-size: .9rem; }
+  th, td { border: 1px solid #ccc; padding: .4rem .6rem; text-align: left; font-size: .85rem; vertical-align: top; }
   th { background: #056; color: #fff; }
   tr:nth-child(even) { background: #f4f7f8; }
   .open { color: #197a19; font-weight: bold; }
   .host { margin-top: 1.5rem; }
+  .vuln { color: #b00; }
   code { background: #eef; padding: 0 .3rem; }
+  small { color: #666; }
 </style>
 </head>
 <body>
 <h1>FastTCPScan — Reporte</h1>
-{{range .Hosts}}
+{{range .}}
 <div class="host">
-  <h2>{{.Addr}}{{if .RDNS}} <small>({{.RDNS}})</small>{{end}}</h2>
+  <h2>{{.Host}}{{if .RDNS}} <small>({{.RDNS}})</small>{{end}}</h2>
   <table>
-    <thead><tr><th>Puerto</th><th>Proto</th><th>Estado</th><th>Servicio</th><th>Versión</th><th>Banner</th></tr></thead>
+    <thead><tr><th>Puerto</th><th>Proto</th><th>Estado</th><th>Servicio</th><th>Versión</th><th>Detalles</th></tr></thead>
     <tbody>
     {{range .Ports}}
       <tr>
-        <td><code>{{.PortID}}</code></td>
-        <td>{{.Protocol}}</td>
-        <td class="open">{{.State.State}}</td>
-        <td>{{.Service.Name}}</td>
-        <td>{{.Service.Version}}</td>
-        <td>{{.Service.Banner}}</td>
+        <td><code>{{.Port}}</code></td>
+        <td>{{.Proto}}</td>
+        <td class="open">{{.State}}</td>
+        <td>{{.Service}}</td>
+        <td>{{.Version}}</td>
+        <td>
+          {{if .HTTP}}{{with .HTTP}}{{if .Status}}{{.Status}}<br>{{end}}{{if .Title}}<b>{{.Title}}</b><br>{{end}}{{if .Server}}Server: {{.Server}}<br>{{end}}{{if .Location}}→ {{.Location}}<br>{{end}}{{end}}{{end}}
+          {{if .TLS}}{{with .TLS}}TLS {{.Version}} · {{.Subject}} · caduca {{.Expires}} ({{.DaysLeft}}d){{if .SelfSigned}} · autofirmado{{end}}{{if .Expired}} · CADUCADO{{end}}<br>{{end}}{{end}}
+          {{if .Banner}}<small>{{.Banner}}</small><br>{{end}}
+          {{range .Vulns}}<span class="vuln">⚠ {{.}}</span><br>{{end}}
+        </td>
       </tr>
     {{end}}
     </tbody>
@@ -131,25 +185,27 @@ var htmlTmpl = template.Must(template.New("report").Parse(`<!DOCTYPE html>
 </html>
 `))
 
+// htmlHost agrupa los puertos de un host para la plantilla HTML.
+type htmlHost struct {
+	Host  string
+	RDNS  string
+	Ports []Result
+}
+
 func writeHTML(w io.Writer, found []Result) error {
 	order, byHost := groupByHost(found)
-	run := xmlRun{}
+	var hosts []htmlHost
 	for _, h := range order {
-		xh := xmlHost{Addr: h}
+		hh := htmlHost{Host: h, Ports: byHost[h]}
 		for _, r := range byHost[h] {
 			if r.RDNS != "" {
-				xh.RDNS = r.RDNS
+				hh.RDNS = r.RDNS
+				break
 			}
-			xh.Ports = append(xh.Ports, xmlPort{
-				Protocol: r.Proto,
-				PortID:   r.Port,
-				State:    xmlState{State: r.State},
-				Service:  xmlService{Name: r.Service, Version: r.Version, Banner: r.Banner},
-			})
 		}
-		run.Hosts = append(run.Hosts, xh)
+		hosts = append(hosts, hh)
 	}
-	if err := htmlTmpl.Execute(w, run); err != nil {
+	if err := htmlTmpl.Execute(w, hosts); err != nil {
 		return fmt.Errorf("error generando HTML: %v", err)
 	}
 	return nil

@@ -213,6 +213,64 @@ func TestGenCompletion(t *testing.T) {
 	}
 }
 
+func TestCheckVulns(t *testing.T) {
+	// Versión vulnerable conocida.
+	hits := checkVulns(Result{Version: "vsftpd 2.3.4"})
+	if len(hits) == 0 || !strings.Contains(hits[0], "CVE-2011-2523") {
+		t.Errorf("checkVulns(vsftpd 2.3.4) = %v, se esperaba la pista del backdoor", hits)
+	}
+	// TLS caducado.
+	hits = checkVulns(Result{TLS: &TLSInfo{Expired: true}})
+	found := false
+	for _, h := range hits {
+		if strings.Contains(h, "caducado") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("checkVulns con TLS caducado debería avisar, got %v", hits)
+	}
+	// Servicio moderno sin coincidencias.
+	if hits := checkVulns(Result{Version: "OpenSSH 9.6p1"}); len(hits) != 0 {
+		t.Errorf("checkVulns(OpenSSH 9.6) = %v, se esperaba vacío", hits)
+	}
+}
+
+func TestParseHTTP(t *testing.T) {
+	raw := "HTTP/1.1 200 OK\r\nServer: nginx/1.25\r\nLocation: /home\r\n\r\n<html><title>Hola Mundo</title></html>"
+	h := parseHTTP(raw)
+	if h == nil {
+		t.Fatal("parseHTTP devolvió nil")
+	}
+	if h.Server != "nginx/1.25" || h.Title != "Hola Mundo" || h.Location != "/home" {
+		t.Errorf("parseHTTP = %+v", h)
+	}
+	if parseHTTP("no es http") != nil {
+		t.Error("parseHTTP de texto no-HTTP debería ser nil")
+	}
+}
+
+func TestClosedSince(t *testing.T) {
+	prev := map[string]Result{
+		diffKey("10.0.0.1", 22, "tcp"): {Host: "10.0.0.1", Port: 22, Proto: "tcp", State: "open"},
+		diffKey("10.0.0.1", 80, "tcp"): {Host: "10.0.0.1", Port: 80, Proto: "tcp", State: "open"},
+	}
+	current := []Result{{Host: "10.0.0.1", Port: 22, Proto: "tcp", State: "open"}}
+	closed := closedSince(prev, current)
+	if len(closed) != 1 || closed[0].Port != 80 {
+		t.Errorf("closedSince = %v, se esperaba el puerto 80", closed)
+	}
+}
+
+func TestUDPProbe(t *testing.T) {
+	if len(udpProbe(53)) < 4 {
+		t.Error("la sonda DNS debería tener payload")
+	}
+	if got := udpProbe(9999); len(got) != 1 || got[0] != 0x00 {
+		t.Errorf("udpProbe de puerto desconocido = %v, se esperaba [0x00]", got)
+	}
+}
+
 func TestProfilesExist(t *testing.T) {
 	for _, name := range []string{"fast", "full", "stealth", "web"} {
 		if _, ok := profiles[name]; !ok {

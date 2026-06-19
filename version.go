@@ -30,25 +30,34 @@ var versionRules = []versionRule{
 	{regexp.MustCompile(`(?i)Redis[^\r\n]*?version[:= ]+([\d.]+)`), "Redis $1"},
 }
 
-// detectVersion lee la respuesta del servicio y extrae producto/versión si puede.
-func detectVersion(conn net.Conn, port int) (version, banner string) {
-	buf := make([]byte, 4096)
+var (
+	reHTTPStatus = regexp.MustCompile(`(?i)^(HTTP/\d\.\d \d{3}[^\r\n]*)`)
+	reHTTPServer = regexp.MustCompile(`(?i)\r\nServer:\s*([^\r\n]+)`)
+	reHTTPLoc    = regexp.MustCompile(`(?i)\r\nLocation:\s*([^\r\n]+)`)
+	reHTMLTitle  = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+)
+
+// detectVersion lee la respuesta del servicio y extrae producto/versión y, en HTTP,
+// los datos de enriquecimiento (estado, título, Server, redirección).
+func detectVersion(conn net.Conn, port int) (version, banner string, http *HTTPInfo) {
+	buf := make([]byte, 8192)
 	conn.SetReadDeadline(time.Now().Add(time.Second))
 	n, err := conn.Read(buf)
 
-	// Servicios que no saludan primero (HTTP, etc.): enviamos una petición.
+	// Servicios que no saludan primero (HTTP, etc.): enviamos una petición GET.
 	if (err != nil || n == 0) && isHTTPPort(port) {
 		conn.SetWriteDeadline(time.Now().Add(750 * time.Millisecond))
-		conn.Write([]byte("GET / HTTP/1.0\r\nHost: scan\r\n\r\n"))
+		conn.Write([]byte("GET / HTTP/1.0\r\nHost: scan\r\nUser-Agent: fastTCPScan\r\n\r\n"))
 		conn.SetReadDeadline(time.Now().Add(time.Second))
 		n, err = conn.Read(buf)
 	}
 	if err != nil || n == 0 {
-		return "", ""
+		return "", "", nil
 	}
 
 	raw := string(buf[:n])
 	banner = sanitize(raw)
+	http = parseHTTP(raw)
 
 	for _, rule := range versionRules {
 		m := rule.re.FindStringSubmatch(raw)
@@ -59,7 +68,31 @@ func detectVersion(conn net.Conn, port int) (version, banner string) {
 		for i := len(m) - 1; i >= 1; i-- {
 			v = strings.ReplaceAll(v, "$"+strconv.Itoa(i), strings.TrimSpace(m[i]))
 		}
-		return sanitize(v), banner
+		return sanitize(v), banner, http
 	}
-	return "", banner
+	return "", banner, http
+}
+
+// parseHTTP extrae estado, Server, redirección y título de una respuesta HTTP.
+func parseHTTP(raw string) *HTTPInfo {
+	if !strings.HasPrefix(raw, "HTTP/") {
+		return nil
+	}
+	h := &HTTPInfo{}
+	if m := reHTTPStatus.FindStringSubmatch(raw); m != nil {
+		h.Status = sanitize(m[1])
+	}
+	if m := reHTTPServer.FindStringSubmatch(raw); m != nil {
+		h.Server = sanitize(m[1])
+	}
+	if m := reHTTPLoc.FindStringSubmatch(raw); m != nil {
+		h.Location = sanitize(m[1])
+	}
+	if m := reHTMLTitle.FindStringSubmatch(raw); m != nil {
+		h.Title = sanitize(m[1])
+	}
+	if h.Status == "" && h.Server == "" && h.Title == "" && h.Location == "" {
+		return nil
+	}
+	return h
 }

@@ -59,6 +59,10 @@ var (
 	profile    = flag.String("profile", "", "Perfil de escaneo: fast, full, stealth o web")
 	configFile = flag.String("config", "", "Archivo de configuración (clave = valor por línea)")
 	completion = flag.String("completion", "", "Imprimir script de autocompletado: bash, zsh o fish")
+
+	stream   = flag.Bool("stream", false, "Imprimir cada puerto abierto en cuanto se descubre (solo formato text)")
+	diffFile = flag.String("diff", "", "Comparar con un escaneo JSON previo y marcar puertos nuevos/cerrados")
+	vuln     = flag.Bool("vuln", false, "Mostrar pistas de vulnerabilidades conocidas según servicio/versión (heurístico)")
 )
 
 // limiter regula el ritmo de sondas cuando -rate > 0 (nil = sin límite).
@@ -106,23 +110,39 @@ func topPortsN(n int) []int {
 
 // Result describe el estado de un puerto en un host concreto.
 type Result struct {
-	Host    string   `json:"host"`
-	Port    int      `json:"port"`
-	Proto   string   `json:"proto"`
-	State   string   `json:"state"`
-	Service string   `json:"service,omitempty"`
-	Version string   `json:"version,omitempty"`
-	Banner  string   `json:"banner,omitempty"`
-	RDNS    string   `json:"rdns,omitempty"`
-	TLS     *TLSInfo `json:"tls,omitempty"`
+	Host    string    `json:"host"`
+	Port    int       `json:"port"`
+	Proto   string    `json:"proto"`
+	State   string    `json:"state"`
+	Service string    `json:"service,omitempty"`
+	Version string    `json:"version,omitempty"`
+	Banner  string    `json:"banner,omitempty"`
+	RDNS    string    `json:"rdns,omitempty"`
+	HTTP    *HTTPInfo `json:"http,omitempty"`
+	TLS     *TLSInfo  `json:"tls,omitempty"`
+	Vulns   []string  `json:"vulns,omitempty"`
+	Change  string    `json:"change,omitempty"` // "new" si aparece respecto a -diff
 }
 
-// TLSInfo resume el certificado presentado por un servicio TLS.
+// TLSInfo resume el certificado y la conexión TLS de un servicio.
 type TLSInfo struct {
-	Subject  string   `json:"subject,omitempty"`
-	Issuer   string   `json:"issuer,omitempty"`
-	Expires  string   `json:"expires,omitempty"`
-	DNSNames []string `json:"dns_names,omitempty"`
+	Subject    string   `json:"subject,omitempty"`
+	Issuer     string   `json:"issuer,omitempty"`
+	Expires    string   `json:"expires,omitempty"`
+	DaysLeft   int      `json:"days_left"`
+	Version    string   `json:"version,omitempty"`
+	Cipher     string   `json:"cipher,omitempty"`
+	SelfSigned bool     `json:"self_signed,omitempty"`
+	Expired    bool     `json:"expired,omitempty"`
+	DNSNames   []string `json:"dns_names,omitempty"`
+}
+
+// HTTPInfo resume la respuesta de un servicio HTTP(S).
+type HTTPInfo struct {
+	Status   string `json:"status,omitempty"`
+	Title    string `json:"title,omitempty"`
+	Server   string `json:"server,omitempty"`
+	Location string `json:"location,omitempty"`
 }
 
 // adaptiveGate limita las sondas en vuelo y puede reducir su límite dinámicamente.
@@ -699,10 +719,10 @@ func probe(ctx context.Context, j job) Result {
 
 	res.Service = serviceName(j.port)
 
-	// UDP no tiene conexión: enviamos una sonda y deducimos el estado.
+	// UDP no tiene conexión: enviamos una sonda específica del protocolo y deducimos el estado.
 	if *proto == "udp" {
 		conn.SetDeadline(time.Now().Add(*timeout))
-		conn.Write([]byte{0x00})
+		conn.Write(udpProbe(j.port))
 
 		buf := make([]byte, 1024)
 		n, rerr := conn.Read(buf)
@@ -721,12 +741,15 @@ func probe(ctx context.Context, j job) Result {
 	res.State = "open"
 	switch {
 	case *sv:
-		res.Version, res.Banner = detectVersion(conn, j.port)
+		res.Version, res.Banner, res.HTTP = detectVersion(conn, j.port)
 	case *banner:
 		res.Banner = grabBanner(conn, j.port)
 	}
 	if *tlsInfo {
 		res.TLS = grabTLS(ctx, j.host, j.port)
+	}
+	if *vuln {
+		res.Vulns = checkVulns(res)
 	}
 	return res
 }
@@ -749,16 +772,40 @@ func grabTLS(ctx context.Context, host string, port int) *TLSInfo {
 	if err := conn.Handshake(); err != nil {
 		return nil
 	}
-	certs := conn.ConnectionState().PeerCertificates
-	if len(certs) == 0 {
+	st := conn.ConnectionState()
+	if len(st.PeerCertificates) == 0 {
 		return nil
 	}
-	c := certs[0]
-	return &TLSInfo{
-		Subject:  c.Subject.CommonName,
-		Issuer:   c.Issuer.CommonName,
-		Expires:  c.NotAfter.Format("2006-01-02"),
-		DNSNames: c.DNSNames,
+	c := st.PeerCertificates[0]
+
+	now := time.Now()
+	info := &TLSInfo{
+		Subject:    c.Subject.CommonName,
+		Issuer:     c.Issuer.CommonName,
+		Expires:    c.NotAfter.Format("2006-01-02"),
+		DaysLeft:   int(time.Until(c.NotAfter).Hours() / 24),
+		Version:    tlsVersionName(st.Version),
+		Cipher:     tls.CipherSuiteName(st.CipherSuite),
+		SelfSigned: c.Subject.CommonName == c.Issuer.CommonName,
+		Expired:    now.After(c.NotAfter) || now.Before(c.NotBefore),
+		DNSNames:   c.DNSNames,
+	}
+	return info
+}
+
+// tlsVersionName traduce la constante de versión TLS a texto.
+func tlsVersionName(v uint16) string {
+	switch v {
+	case tls.VersionTLS13:
+		return "TLS 1.3"
+	case tls.VersionTLS12:
+		return "TLS 1.2"
+	case tls.VersionTLS11:
+		return "TLS 1.1"
+	case tls.VersionTLS10:
+		return "TLS 1.0"
+	default:
+		return fmt.Sprintf("0x%04x", v)
 	}
 }
 
@@ -866,13 +913,13 @@ func writeResults(w io.Writer, found []Result) error {
 
 	case "csv":
 		cw := csv.NewWriter(w)
-		cw.Write([]string{"host", "port", "proto", "state", "service", "banner", "tls_subject", "tls_expires"})
+		cw.Write([]string{"host", "port", "proto", "state", "service", "version", "rdns", "banner", "tls_subject", "tls_expires", "vulns", "change"})
 		for _, r := range found {
 			subj, exp := "", ""
 			if r.TLS != nil {
 				subj, exp = r.TLS.Subject, r.TLS.Expires
 			}
-			cw.Write([]string{r.Host, strconv.Itoa(r.Port), r.Proto, r.State, r.Service, r.Banner, subj, exp})
+			cw.Write([]string{r.Host, strconv.Itoa(r.Port), r.Proto, r.State, r.Service, r.Version, r.RDNS, r.Banner, subj, exp, strings.Join(r.Vulns, "; "), r.Change})
 		}
 		cw.Flush()
 		return cw.Error()
@@ -891,27 +938,63 @@ func writeResults(w io.Writer, found []Result) error {
 
 	default: // text
 		for _, r := range found {
-			host := r.Host
-			if r.RDNS != "" {
-				host += " (" + r.RDNS + ")"
-			}
-			line := fmt.Sprintf("%s:%-5d  %-13s", host, r.Port, colorState(r.State))
-			if r.Service != "" {
-				line += " " + r.Service
-			}
-			if r.Version != "" {
-				line += "  " + r.Version
-			}
-			if r.Banner != "" {
-				line += "  | " + r.Banner
-			}
-			if r.TLS != nil {
-				line += fmt.Sprintf("  | TLS CN=%s issuer=%s exp=%s", r.TLS.Subject, r.TLS.Issuer, r.TLS.Expires)
-			}
-			fmt.Fprintln(w, line)
+			fmt.Fprintln(w, formatTextLine(r))
 		}
 		return nil
 	}
+}
+
+// formatTextLine compone la línea de texto de un resultado (reusada por el streaming).
+func formatTextLine(r Result) string {
+	host := r.Host
+	if r.RDNS != "" {
+		host += " (" + r.RDNS + ")"
+	}
+	prefix := ""
+	switch r.Change {
+	case "new":
+		prefix = "+ "
+	case "closed":
+		prefix = "- "
+	}
+	line := fmt.Sprintf("%s%s:%-5d  %-13s", prefix, host, r.Port, colorState(r.State))
+	if r.Service != "" {
+		line += " " + r.Service
+	}
+	if r.Version != "" {
+		line += "  " + r.Version
+	}
+	if r.HTTP != nil {
+		if r.HTTP.Title != "" {
+			line += fmt.Sprintf("  [%s]", r.HTTP.Title)
+		}
+		if r.HTTP.Location != "" {
+			line += "  → " + r.HTTP.Location
+		}
+	}
+	if r.TLS != nil {
+		line += fmt.Sprintf("  | %s CN=%s exp=%s(%dd)", r.TLS.Version, r.TLS.Subject, r.TLS.Expires, r.TLS.DaysLeft)
+		if r.TLS.SelfSigned {
+			line += " self-signed"
+		}
+		if r.TLS.Expired {
+			line += " EXPIRED"
+		}
+	}
+	if r.Banner != "" {
+		line += "  | " + r.Banner
+	}
+	for _, v := range r.Vulns {
+		line += "\n    " + colorVuln("⚠ "+v)
+	}
+	return line
+}
+
+func colorVuln(s string) string {
+	if useColor {
+		return cRed + s + cReset
+	}
+	return s
 }
 
 func main() {
@@ -994,6 +1077,24 @@ func main() {
 		}
 		if os.Geteuid() != 0 {
 			fatalf("-syn requiere privilegios root (ejecútalo con sudo)")
+		}
+	}
+
+	// Streaming solo tiene sentido en formato de texto.
+	if *stream && *format != "text" {
+		fatalf("-stream solo es compatible con -format text")
+	}
+
+	// Modo diff: cargamos el escaneo previo.
+	var prevScan map[string]Result
+	if *diffFile != "" {
+		p, err := loadPreviousScan(*diffFile)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		prevScan = p
+		if verbosity >= 1 {
+			fmt.Fprintf(os.Stderr, "[*] Diff contra %q: %d puerto(s) abierto(s) previos\n", *diffFile, len(prevScan))
 		}
 	}
 
@@ -1130,9 +1231,10 @@ func main() {
 	openCount := int64(len(preFound))
 	found := append([]Result(nil), preFound...)
 
-	// Indicador de progreso a stderr (no contamina los resultados en stdout/archivo).
+	// Indicador de progreso a stderr (en streaming estorbaría a la salida en vivo).
+	showProgress := verbosity >= 1 && !*stream
 	progressDone := make(chan struct{})
-	if verbosity >= 1 {
+	if showProgress {
 		go func() {
 			ticker := time.NewTicker(200 * time.Millisecond)
 			defer ticker.Stop()
@@ -1151,35 +1253,63 @@ func main() {
 	for r := range results {
 		atomic.AddInt64(&scanned, 1)
 		recordCheckpoint(r) // persiste el progreso si -resume está activo
-		if strings.HasPrefix(r.State, "open") {
+		open := strings.HasPrefix(r.State, "open")
+		if open {
 			atomic.AddInt64(&openCount, 1)
+			if prevScan != nil {
+				if _, existed := prevScan[diffKey(r.Host, r.Port, r.Proto)]; !existed {
+					r.Change = "new"
+				}
+			}
+		}
+		if open || *showAll {
 			found = append(found, r)
-		} else if *showAll {
-			found = append(found, r)
+			if *stream {
+				fmt.Fprintln(sink, formatTextLine(r))
+			}
 		}
 	}
 	close(progressDone)
-	if verbosity >= 1 {
+	if showProgress {
 		fmt.Fprintf(os.Stderr, "\r%-90s\r", "") // limpiamos la línea de progreso
 	}
 
-	// Reverse DNS de los hosts con resultados.
-	if *rdns {
-		if verbosity >= 1 {
-			fmt.Fprintln(os.Stderr, "[*] Resolviendo PTR (reverse DNS)…")
+	// Diff: añadimos los puertos que estaban abiertos antes y ya no aparecen.
+	if prevScan != nil {
+		closed := closedSince(prevScan, found)
+		for i := range closed {
+			closed[i].Change = "closed"
 		}
-		resolveRDNS(ctx, found)
+		found = append(found, closed...)
+		if verbosity >= 1 && len(closed) > 0 {
+			fmt.Fprintf(os.Stderr, "[*] %d puerto(s) cerrado(s) desde el escaneo previo\n", len(closed))
+		}
+		if *stream {
+			for _, r := range closed {
+				fmt.Fprintln(sink, formatTextLine(r))
+			}
+		}
 	}
 
-	sort.Slice(found, func(i, j int) bool {
-		if found[i].Host != found[j].Host {
-			return found[i].Host < found[j].Host
+	if !*stream {
+		// Reverse DNS de los hosts con resultados.
+		if *rdns {
+			if verbosity >= 1 {
+				fmt.Fprintln(os.Stderr, "[*] Resolviendo PTR (reverse DNS)…")
+			}
+			resolveRDNS(ctx, found)
 		}
-		return found[i].Port < found[j].Port
-	})
 
-	if err := writeResults(sink, found); err != nil {
-		fatalf("no se pudieron escribir los resultados: %v", err)
+		sort.Slice(found, func(i, j int) bool {
+			if found[i].Host != found[j].Host {
+				return found[i].Host < found[j].Host
+			}
+			return found[i].Port < found[j].Port
+		})
+
+		if err := writeResults(sink, found); err != nil {
+			fatalf("no se pudieron escribir los resultados: %v", err)
+		}
 	}
 
 	if verbosity >= 1 {
