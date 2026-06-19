@@ -9,12 +9,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-          cache: true
+          cache: false   # proyecto sin dependencias: no hay go.sum que cachear
 
       - name: Vet
         run: go vet ./...
@@ -36,11 +36,11 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-          cache: true
+          cache: false   # proyecto sin dependencias: no hay go.sum que cachear
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
@@ -53,11 +53,11 @@ jobs:
         goos: [linux, darwin, windows]
         goarch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-          cache: true
+          cache: false   # proyecto sin dependencias: no hay go.sum que cachear
       - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
         env:
           GOOS: ${{ matrix.goos }}

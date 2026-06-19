@@ -33,8 +33,9 @@ ideal for quickly discovering open ports on a host.
 :heavy_check_mark: Read targets from a file (`-iL`) and save results to a file (`-o`);\
 :heavy_check_mark: Host discovery (TCP ping) to skip dead hosts (`-discover`);\
 :heavy_check_mark: Rate limiting (`-rate`) and randomized scan order (`-randomize`);\
-:heavy_check_mark: TCP, UDP and **SYN half-open** scanning (`-syn`, Linux + root);\
-:heavy_check_mark: Service detection, **version detection** (`-sV`), banner grabbing and TLS certificate inspection (`-tls`);\
+:heavy_check_mark: TCP, UDP (with protocol-specific payloads) and **SYN half-open** scanning (`-syn`, Linux + root);\
+:heavy_check_mark: Service detection, **version detection** (`-sV`), banner grabbing, **HTTP enrichment** (title/status/server) and TLS inspection (`-tls`: version, cipher, expiry, self-signed);\
+:heavy_check_mark: Heuristic **vulnerability hints** (`-vuln`), live **streaming** output (`-stream`) and **diff** against a previous scan (`-diff`);\
 :heavy_check_mark: **SOCKS5 proxy** support (`-proxy`) and **reverse DNS** (`-rdns`);\
 :heavy_check_mark: Target/port **exclusion lists** (`-exclude`, `-exclude-ports`);\
 :heavy_check_mark: Configurable timeout and retries per port;\
@@ -138,6 +139,22 @@ $ fastTCPScan -host 192.168.1.1 -profile web
 # Load options from a config file (command-line flags still win)
 $ fastTCPScan -config scan.conf -host 192.168.1.1
 
+# Service + version + HTTP details + vulnerability hints
+$ fastTCPScan -host 192.168.1.1 -top 1000 -sV -vuln
+
+# Stream open ports live as they are found
+$ fastTCPScan -host 192.168.1.0/24 -top 100 -stream
+
+# Diff against a previous JSON scan (marks + new / - closed ports)
+$ fastTCPScan -host 192.168.1.0/24 -top 100 -format json -o today.json
+$ fastTCPScan -host 192.168.1.0/24 -top 100 -diff today.json
+
+# Nmap-compatible XML (importable by other tools)
+$ fastTCPScan -host 192.168.1.1 -top 100 -sV -format xml -o scan.xml
+
+# UDP scan with protocol-specific probes (DNS, NTP, SNMP, …)
+$ fastTCPScan -host 192.168.1.1 -range 53,123,161 -proto udp
+
 # Generate shell completions
 $ fastTCPScan -completion bash > /etc/bash_completion.d/fastTCPScan
 $ fastTCPScan -completion zsh  > "${fpath[1]}/_fastTCPScan"
@@ -185,8 +202,11 @@ $ fastTCPScan -host 192.168.1.1 -range 1-1024 -rate 500 -randomize -json -o resu
 | `-syn`       | `false`       | SYN half-open scan (Linux, requires root)                  |
 | `-proxy`     | —             | SOCKS5 proxy for TCP connections (`[user:pass@]host:port`) |
 | `-banner`    | `false`       | Try to grab the service banner on open ports                |
-| `-sV`        | `false`       | Service version detection on open ports                     |
-| `-tls`       | `false`       | TLS handshake on open ports; show certificate details       |
+| `-sV`        | `false`       | Service version detection + HTTP enrichment on open ports   |
+| `-tls`       | `false`       | TLS handshake on open ports; cert, version, cipher, expiry  |
+| `-vuln`      | `false`       | Heuristic vulnerability hints from service/version          |
+| `-stream`    | `false`       | Print each open port live (text format only)                |
+| `-diff`      | —             | Compare against a previous JSON scan (marks new/closed)     |
 | `-rdns`      | `false`       | Reverse-DNS (PTR) lookup of hosts with results              |
 | `-exclude`   | —             | Hosts/IP/CIDR to exclude (comma-separated)                  |
 | `-exclude-ports` | —         | Ports to exclude (e.g. `22,80,8000-8100`)                  |
