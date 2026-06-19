@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,12 +41,24 @@ var (
 	discover  = flag.Bool("discover", false, "Descubrir hosts vivos (TCP ping) y omitir los que no respondan")
 	randomize = flag.Bool("randomize", false, "Aleatorizar el orden de hosts y puertos")
 
-	format   = flag.String("format", "text", "Formato de salida: text, json, csv o grep")
+	format   = flag.String("format", "text", "Formato de salida: text, json, csv, grep, xml o html")
 	noColor  = flag.Bool("no-color", false, "Desactivar el color en la salida de texto")
 	tlsInfo  = flag.Bool("tls", false, "Realizar handshake TLS en puertos abiertos y mostrar datos del certificado")
 	verbose  = flag.Bool("v", false, "Salida detallada (verbose)")
 	quiet    = flag.Bool("q", false, "Salida mínima: solo resultados, sin progreso ni resumen")
 	deadline = flag.Duration("deadline", 0, "Tiempo máximo total del escaneo (ej. 5m); 0 = sin límite")
+
+	sv        = flag.Bool("sV", false, "Detección de versión de servicio en puertos abiertos")
+	synScan   = flag.Bool("syn", false, "Escaneo SYN half-open (solo Linux, requiere privilegios root)")
+	proxyAddr = flag.String("proxy", "", "Proxy SOCKS5 para las conexiones TCP (ej. 127.0.0.1:1080)")
+	excludeH  = flag.String("exclude", "", "Hosts/IP/CIDR a excluir, separados por comas")
+	excludeP  = flag.String("exclude-ports", "", "Puertos a excluir (ej. 80,443,8000-8100)")
+	rdns      = flag.Bool("rdns", false, "Resolver el nombre inverso (PTR) de los hosts con puertos abiertos")
+	resume    = flag.String("resume", "", "Archivo de checkpoint para guardar y reanudar el progreso")
+
+	profile    = flag.String("profile", "", "Perfil de escaneo: fast, full, stealth o web")
+	configFile = flag.String("config", "", "Archivo de configuración (clave = valor por línea)")
+	completion = flag.String("completion", "", "Imprimir script de autocompletado: bash, zsh o fish")
 )
 
 // limiter regula el ritmo de sondas cuando -rate > 0 (nil = sin límite).
@@ -98,7 +111,9 @@ type Result struct {
 	Proto   string   `json:"proto"`
 	State   string   `json:"state"`
 	Service string   `json:"service,omitempty"`
+	Version string   `json:"version,omitempty"`
 	Banner  string   `json:"banner,omitempty"`
+	RDNS    string   `json:"rdns,omitempty"`
 	TLS     *TLSInfo `json:"tls,omitempty"`
 }
 
@@ -399,14 +414,13 @@ func discoverHosts(ctx context.Context, hosts []string) []string {
 
 // hostAlive intenta conectar a varios puertos comunes; devuelve true al primer éxito.
 func hostAlive(ctx context.Context, h string) bool {
-	dialer := net.Dialer{Timeout: *timeout}
 	for _, p := range discoverPorts {
 		select {
 		case <-ctx.Done():
 			return false
 		default:
 		}
-		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(h, strconv.Itoa(p)))
+		conn, err := dialContext(ctx, "tcp", net.JoinHostPort(h, strconv.Itoa(p)))
 		if err == nil {
 			conn.Close()
 			return true
@@ -423,6 +437,105 @@ func shuffleInts(s []int) {
 // shuffleStrings baraja una lista de hosts en sitio.
 func shuffleStrings(s []string) {
 	rand.Shuffle(len(s), func(i, j int) { s[i], s[j] = s[j], s[i] })
+}
+
+// applyExclusions elimina de hosts/ports los objetivos indicados con -exclude / -exclude-ports.
+func applyExclusions(hosts []string, ports []int) ([]string, []int, error) {
+	if *excludeH != "" {
+		ex, err := expandHosts(*excludeH)
+		if err != nil {
+			return nil, nil, fmt.Errorf("-exclude: %v", err)
+		}
+		drop := make(map[string]bool, len(ex))
+		for _, h := range ex {
+			drop[h] = true
+		}
+		filtered := hosts[:0]
+		for _, h := range hosts {
+			if !drop[h] {
+				filtered = append(filtered, h)
+			}
+		}
+		hosts = filtered
+	}
+
+	if *excludeP != "" {
+		ex, err := expandPorts(*excludeP)
+		if err != nil {
+			return nil, nil, fmt.Errorf("-exclude-ports: %v", err)
+		}
+		drop := make(map[int]bool, len(ex))
+		for _, p := range ex {
+			drop[p] = true
+		}
+		filtered := ports[:0]
+		for _, p := range ports {
+			if !drop[p] {
+				filtered = append(filtered, p)
+			}
+		}
+		ports = filtered
+	}
+
+	if len(hosts) == 0 {
+		return nil, nil, fmt.Errorf("no quedan hosts tras aplicar las exclusiones")
+	}
+	if len(ports) == 0 {
+		return nil, nil, fmt.Errorf("no quedan puertos tras aplicar las exclusiones")
+	}
+	return hosts, ports, nil
+}
+
+// resolveRDNS rellena el campo RDNS de cada resultado resolviendo el PTR de cada host.
+func resolveRDNS(ctx context.Context, results []Result) {
+	uniq := make(map[string]string)
+	for _, r := range results {
+		uniq[r.Host] = ""
+	}
+
+	in := make(chan string)
+	type kv struct{ host, name string }
+	out := make(chan kv)
+
+	n := 20
+	if n > len(uniq) {
+		n = len(uniq)
+	}
+	if n < 1 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			for h := range in {
+				name := ""
+				if names, err := net.DefaultResolver.LookupAddr(ctx, h); err == nil && len(names) > 0 {
+					name = strings.TrimSuffix(names[0], ".")
+				}
+				out <- kv{h, name}
+			}
+		}()
+	}
+	go func() {
+		for h := range uniq {
+			in <- h
+		}
+		close(in)
+	}()
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	for r := range out {
+		uniq[r.host] = r.name
+	}
+	for i := range results {
+		results[i].RDNS = uniq[results[i].Host]
+	}
 }
 
 func expandCIDR(cidr string) ([]string, error) {
@@ -473,6 +586,9 @@ func generateJobs(ctx context.Context, hosts []string, ports []int) <-chan job {
 		defer close(out)
 		for _, h := range hosts {
 			for _, p := range ports {
+				if ckptDone != nil && ckptDone[jobKey(h, p)] {
+					continue // ya completado en una ejecución anterior
+				}
 				select {
 				case out <- job{h, p}:
 				case <-done:
@@ -537,16 +653,29 @@ func scan(ctx context.Context, jobs <-chan job) <-chan Result {
 	return out
 }
 
+// dialContext abre una conexión respetando el proxy SOCKS5 si está configurado.
+func dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if socksProxy != nil {
+		return socksProxy.dial(ctx, addr) // SOCKS5 solo soporta TCP
+	}
+	return (&net.Dialer{Timeout: *timeout}).DialContext(ctx, network, addr)
+}
+
 // probe sondea un único puerto, con reintentos y detección de servicio/banner.
 func probe(ctx context.Context, j job) Result {
 	res := Result{Host: j.host, Port: j.port, Proto: *proto, State: "closed"}
+
+	// Escaneo SYN half-open (ruta independiente, solo TCP).
+	if *synScan && *proto == "tcp" {
+		return synProbe(ctx, j)
+	}
+
 	addr := net.JoinHostPort(j.host, strconv.Itoa(j.port))
 
 	var (
 		conn net.Conn
 		err  error
 	)
-	dialer := net.Dialer{Timeout: *timeout}
 
 	for attempt := 0; attempt <= *retries; attempt++ {
 		select {
@@ -554,7 +683,7 @@ func probe(ctx context.Context, j job) Result {
 			return res
 		default:
 		}
-		conn, err = dialer.DialContext(ctx, *proto, addr)
+		conn, err = dialContext(ctx, *proto, addr)
 		if err == nil {
 			break
 		}
@@ -590,7 +719,10 @@ func probe(ctx context.Context, j job) Result {
 	}
 
 	res.State = "open"
-	if *banner {
+	switch {
+	case *sv:
+		res.Version, res.Banner = detectVersion(conn, j.port)
+	case *banner:
 		res.Banner = grabBanner(conn, j.port)
 	}
 	if *tlsInfo {
@@ -601,7 +733,7 @@ func probe(ctx context.Context, j job) Result {
 
 // grabTLS realiza un handshake TLS y extrae los datos básicos del certificado.
 func grabTLS(ctx context.Context, host string, port int) *TLSInfo {
-	raw, err := (&net.Dialer{Timeout: *timeout}).DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	raw, err := dialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return nil
 	}
@@ -668,6 +800,35 @@ func sanitize(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// progressLine construye la línea de progreso con barra, porcentaje, tasa y ETA.
+func progressLine(done, total, openN, preDone int64, start time.Time) string {
+	frac := 0.0
+	if total > 0 {
+		frac = float64(done) / float64(total)
+	}
+
+	const width = 24
+	filled := int(frac * width)
+	if filled > width {
+		filled = width
+	}
+	bar := "[" + strings.Repeat("#", filled) + strings.Repeat("-", width-filled) + "]"
+
+	elapsed := time.Since(start).Seconds()
+	rate := 0.0
+	if elapsed > 0 {
+		rate = float64(done-preDone) / elapsed
+	}
+	eta := "—"
+	if rate > 0 && done < total {
+		secs := float64(total-done) / rate
+		eta = (time.Duration(secs) * time.Second).Round(time.Second).String()
+	}
+
+	return fmt.Sprintf("\r%s %5.1f%% | %d/%d | %.0f/s | ETA %s | abiertos %d   ",
+		bar, frac*100, done, total, rate, eta, openN)
+}
+
 // isTerminal indica si el descriptor es una terminal interactiva.
 func isTerminal(f *os.File) bool {
 	fi, err := f.Stat()
@@ -722,11 +883,24 @@ func writeResults(w io.Writer, found []Result) error {
 		}
 		return nil
 
+	case "xml":
+		return writeXML(w, found)
+
+	case "html":
+		return writeHTML(w, found)
+
 	default: // text
 		for _, r := range found {
-			line := fmt.Sprintf("%s:%-5d  %-13s", r.Host, r.Port, colorState(r.State))
+			host := r.Host
+			if r.RDNS != "" {
+				host += " (" + r.RDNS + ")"
+			}
+			line := fmt.Sprintf("%s:%-5d  %-13s", host, r.Port, colorState(r.State))
 			if r.Service != "" {
 				line += " " + r.Service
+			}
+			if r.Version != "" {
+				line += "  " + r.Version
 			}
 			if r.Banner != "" {
 				line += "  | " + r.Banner
@@ -742,6 +916,23 @@ func writeResults(w io.Writer, found []Result) error {
 
 func main() {
 	flag.Parse()
+
+	// Autocompletado: imprime el script y termina.
+	if *completion != "" {
+		script, err := genCompletion(*completion)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		fmt.Print(script)
+		return
+	}
+
+	// Perfil y archivo de config (sin pisar los flags pasados en la línea de comandos).
+	explicit := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	if err := applySettings(explicit); err != nil {
+		fatalf("%v", err)
+	}
 
 	*proto = strings.ToLower(strings.TrimSpace(*proto))
 	if *proto != "tcp" && *proto != "udp" {
@@ -760,9 +951,9 @@ func main() {
 		*format = "json"
 	}
 	switch *format {
-	case "text", "json", "csv", "grep":
+	case "text", "json", "csv", "grep", "xml", "html":
 	default:
-		fatalf("formato no soportado: %q (usa text, json, csv o grep)", *format)
+		fatalf("formato no soportado: %q (usa text, json, csv, grep, xml o html)", *format)
 	}
 
 	// Nivel de verbosidad.
@@ -776,6 +967,34 @@ func main() {
 		verbosity = 2
 	default:
 		verbosity = 1
+	}
+
+	// Proxy SOCKS5.
+	if *proxyAddr != "" {
+		if *proto == "udp" {
+			fatalf("-proxy (SOCKS5) solo soporta TCP, no UDP")
+		}
+		p, err := parseProxy(*proxyAddr)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		socksProxy = p
+	}
+
+	// Escaneo SYN: validaciones de plataforma y privilegios.
+	if *synScan {
+		if runtime.GOOS != "linux" {
+			fatalf("-syn solo está disponible en Linux")
+		}
+		if *proto != "tcp" {
+			fatalf("-syn requiere -proto tcp")
+		}
+		if socksProxy != nil {
+			fatalf("-syn no es compatible con -proxy (usa sockets raw)")
+		}
+		if os.Geteuid() != 0 {
+			fatalf("-syn requiere privilegios root (ejecútalo con sudo)")
+		}
 	}
 
 	checkFDLimit()
@@ -795,9 +1014,34 @@ func main() {
 		}
 	}
 
+	// Exclusiones de hosts y/o puertos.
+	if *excludeH != "" || *excludeP != "" {
+		hosts, ports, err = applyExclusions(hosts, ports)
+		if err != nil {
+			fatalf("%v", err)
+		}
+	}
+
 	if *randomize {
 		shuffleStrings(hosts)
 		shuffleInts(ports)
+	}
+
+	// Checkpoint: cargamos progreso previo y abrimos el archivo para ir guardando.
+	var preFound []Result
+	if *resume != "" {
+		preFound, err = loadCheckpoint(*resume)
+		if err != nil {
+			fatalf("no se pudo leer el checkpoint %q: %v", *resume, err)
+		}
+		if err := openCheckpoint(*resume); err != nil {
+			fatalf("no se pudo abrir el checkpoint %q: %v", *resume, err)
+		}
+		defer closeCheckpoint()
+		if verbosity >= 1 && len(ckptDone) > 0 {
+			fmt.Fprintf(os.Stderr, "[*] Reanudando: %d sondas ya completadas, %d puerto(s) abierto(s) recuperado(s)\n",
+				len(ckptDone), len(preFound))
+		}
 	}
 
 	// Límite global de sondas por segundo.
@@ -862,6 +1106,18 @@ func main() {
 
 	total := int64(len(hosts) * len(ports))
 
+	// Sondas ya completadas en una ejecución previa (resume).
+	var preDone int64
+	if len(ckptDone) > 0 {
+		for _, h := range hosts {
+			for _, p := range ports {
+				if ckptDone[jobKey(h, p)] {
+					preDone++
+				}
+			}
+		}
+	}
+
 	if verbosity >= 1 {
 		fmt.Fprintf(os.Stderr, "\n[*] Escaneando %d host(s) × %d puerto(s) = %d sondas [%s]\n\n",
 			len(hosts), len(ports), total, strings.ToUpper(*proto))
@@ -870,8 +1126,9 @@ func main() {
 	start := time.Now()
 	results := scan(ctx, generateJobs(ctx, hosts, ports))
 
-	var scanned, openCount int64
-	var found []Result
+	scanned := preDone
+	openCount := int64(len(preFound))
+	found := append([]Result(nil), preFound...)
 
 	// Indicador de progreso a stderr (no contamina los resultados en stdout/archivo).
 	progressDone := make(chan struct{})
@@ -885,8 +1142,7 @@ func main() {
 					return
 				case <-ticker.C:
 					done := atomic.LoadInt64(&scanned)
-					fmt.Fprintf(os.Stderr, "\r[*] Progreso: %d/%d (%.1f%%) | abiertos: %d   ",
-						done, total, float64(done)/float64(total)*100, atomic.LoadInt64(&openCount))
+					fmt.Fprint(os.Stderr, progressLine(done, total, atomic.LoadInt64(&openCount), preDone, start))
 				}
 			}
 		}()
@@ -894,6 +1150,7 @@ func main() {
 
 	for r := range results {
 		atomic.AddInt64(&scanned, 1)
+		recordCheckpoint(r) // persiste el progreso si -resume está activo
 		if strings.HasPrefix(r.State, "open") {
 			atomic.AddInt64(&openCount, 1)
 			found = append(found, r)
@@ -903,7 +1160,15 @@ func main() {
 	}
 	close(progressDone)
 	if verbosity >= 1 {
-		fmt.Fprintf(os.Stderr, "\r%-70s\r", "") // limpiamos la línea de progreso
+		fmt.Fprintf(os.Stderr, "\r%-90s\r", "") // limpiamos la línea de progreso
+	}
+
+	// Reverse DNS de los hosts con resultados.
+	if *rdns {
+		if verbosity >= 1 {
+			fmt.Fprintln(os.Stderr, "[*] Resolviendo PTR (reverse DNS)…")
+		}
+		resolveRDNS(ctx, found)
 	}
 
 	sort.Slice(found, func(i, j int) bool {

@@ -47,7 +47,7 @@ go.work
 .LSOverride
 
 # Icon must end with two \r
-Icon
+Icon
 
 # Thumbnails
 ._*
@@ -127,3 +127,6 @@ $RECYCLE.BIN/
 
 # Salida de GoReleaser
 dist/
+
+# Cobertura de tests
+coverage.out

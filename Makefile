@@ -2,7 +2,7 @@ BINARY  := fastTCPScan
 PREFIX  ?= /usr/local/bin
 LDFLAGS := -s -w
 
-.PHONY: all build compress install uninstall test vet fmt clean
+.PHONY: all build compress install uninstall test cover fuzz vet lint fmt clean
 
 all: build
 
@@ -26,9 +26,24 @@ uninstall:
 test:
 	go test -v ./...
 
+## cover: tests con cobertura (genera coverage.out)
+cover:
+	go test -race -covermode=atomic -coverprofile=coverage.out ./...
+	go tool cover -func=coverage.out | tail -1
+
+## fuzz: ejecuta los fuzz tests de los parsers (FUZZTIME por defecto 30s)
+FUZZTIME ?= 30s
+fuzz:
+	go test -run=^$$ -fuzz=FuzzExpandPorts -fuzztime=$(FUZZTIME) .
+	go test -run=^$$ -fuzz=FuzzExpandCIDR -fuzztime=$(FUZZTIME) .
+
 ## vet: análisis estático
 vet:
 	go vet ./...
+
+## lint: golangci-lint (requiere golangci-lint instalado)
+lint:
+	golangci-lint run
 
 ## fmt: formatea el código
 fmt:

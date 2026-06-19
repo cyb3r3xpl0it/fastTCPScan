@@ -1,7 +1,9 @@
 package main
 
 import (
+	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -126,5 +128,118 @@ func TestIsHTTPPort(t *testing.T) {
 	}
 	if isHTTPPort(22) {
 		t.Error("22 no debería ser puerto HTTP")
+	}
+}
+
+func TestParseProxy(t *testing.T) {
+	cases := []struct {
+		in               string
+		addr, user, pass string
+	}{
+		{"127.0.0.1:1080", "127.0.0.1:1080", "", ""},
+		{"socks5://127.0.0.1:1080", "127.0.0.1:1080", "", ""},
+		{"user:pass@10.0.0.1:9050", "10.0.0.1:9050", "user", "pass"},
+		{"socks5://bob@proxy.local:1080", "proxy.local:1080", "bob", ""},
+	}
+	for _, c := range cases {
+		p, err := parseProxy(c.in)
+		if err != nil {
+			t.Errorf("parseProxy(%q) error inesperado: %v", c.in, err)
+			continue
+		}
+		if p.addr != c.addr || p.user != c.user || p.pass != c.pass {
+			t.Errorf("parseProxy(%q) = {%q,%q,%q}, se esperaba {%q,%q,%q}",
+				c.in, p.addr, p.user, p.pass, c.addr, c.user, c.pass)
+		}
+	}
+	for _, in := range []string{"sinpuerto", "user@", ""} {
+		if _, err := parseProxy(in); err == nil {
+			t.Errorf("parseProxy(%q) debería devolver error", in)
+		}
+	}
+}
+
+func TestGroupByHost(t *testing.T) {
+	found := []Result{
+		{Host: "10.0.0.2", Port: 22},
+		{Host: "10.0.0.1", Port: 443},
+		{Host: "10.0.0.1", Port: 80},
+	}
+	order, byHost := groupByHost(found)
+	if !reflect.DeepEqual(order, []string{"10.0.0.1", "10.0.0.2"}) {
+		t.Errorf("orden = %v", order)
+	}
+	if len(byHost["10.0.0.1"]) != 2 || len(byHost["10.0.0.2"]) != 1 {
+		t.Errorf("agrupación incorrecta: %v", byHost)
+	}
+}
+
+func TestReadConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/scan.conf"
+	content := "# comentario\n; otro comentario\n\ntop = 100\ntimeout = 800ms\nsV = true\nrange = \"1-1000\"\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	kv, err := readConfig(path)
+	if err != nil {
+		t.Fatalf("readConfig error: %v", err)
+	}
+	want := map[string]string{"top": "100", "timeout": "800ms", "sV": "true", "range": "1-1000"}
+	if !reflect.DeepEqual(kv, want) {
+		t.Errorf("readConfig = %v, se esperaba %v", kv, want)
+	}
+
+	// Línea inválida (sin '=').
+	bad := dir + "/bad.conf"
+	os.WriteFile(bad, []byte("esto no es valido\n"), 0o644)
+	if _, err := readConfig(bad); err == nil {
+		t.Error("readConfig debería fallar con una línea sin '='")
+	}
+}
+
+func TestGenCompletion(t *testing.T) {
+	for _, shell := range []string{"bash", "zsh", "fish"} {
+		out, err := genCompletion(shell)
+		if err != nil {
+			t.Errorf("genCompletion(%q) error: %v", shell, err)
+		}
+		if !strings.Contains(out, "host") || len(out) == 0 {
+			t.Errorf("genCompletion(%q) no contiene los flags esperados", shell)
+		}
+	}
+	if _, err := genCompletion("tcsh"); err == nil {
+		t.Error("genCompletion(\"tcsh\") debería devolver error")
+	}
+}
+
+func TestProfilesExist(t *testing.T) {
+	for _, name := range []string{"fast", "full", "stealth", "web"} {
+		if _, ok := profiles[name]; !ok {
+			t.Errorf("falta el perfil %q", name)
+		}
+	}
+}
+
+func TestDetectVersionRules(t *testing.T) {
+	// Verifica que las reglas de versión extraen el producto esperado del banner.
+	cases := []struct{ banner, want string }{
+		{"SSH-2.0-OpenSSH_9.6p1 Ubuntu", "OpenSSH 9.6p1"},
+		{"HTTP/1.1 200 OK\r\nServer: nginx/1.25.3\r\n", "nginx/1.25.3"},
+	}
+	for _, c := range cases {
+		got := ""
+		for _, rule := range versionRules {
+			if m := rule.re.FindStringSubmatch(c.banner); m != nil {
+				got = rule.tmpl
+				for i := len(m) - 1; i >= 1; i-- {
+					got = strings.ReplaceAll(got, "$"+strconv.Itoa(i), strings.TrimSpace(m[i]))
+				}
+				break
+			}
+		}
+		if got != c.want {
+			t.Errorf("banner %q → %q, se esperaba %q", c.banner, got, c.want)
+		}
 	}
 }
